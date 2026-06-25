@@ -1,19 +1,36 @@
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
 import base64
-from cryptography.fernet import Fernet
 
-# 生成密钥（实际使用中应保存密钥）
-key = Fernet.generate_key()
-cipher = Fernet(key)
+# 生成RSA公私钥对
+private_key = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
+)
+public_key = private_key.public_key()
 
 # 原始消息
 message = "Hello, World!"
 
-# 加密
-encrypted = cipher.encrypt(message.encode())
+# 使用公钥加密
+encrypted = public_key.encrypt(
+    message.encode(),
+    padding.OAEP(
+        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+        algorithm=hashes.SHA256(),
+        label=None
+    )
+)
 print(f"原始消息: {message}")
-print(f"加密密钥: {key.decode()}")
-print(f"加密后: {encrypted.decode()}")
+print(f"加密后 (base64): {base64.b64encode(encrypted).decode()}")
 
-# 解密验证（演示用途）
-decrypted = cipher.decrypt(encrypted).decode()
+# 使用私钥解密
+decrypted = private_key.decrypt(
+    encrypted,
+    padding.OAEP(
+        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+        algorithm=hashes.SHA256(),
+        label=None
+    )
+).decode()
 print(f"解密后: {decrypted}")

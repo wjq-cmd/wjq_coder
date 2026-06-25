@@ -1,0 +1,21 @@
+{
+  "name": "claude-code-tui",
+  "version": "1.0.0",
+  "description": "Beautiful terminal UI for Claude Code clone",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "ora": "^8.0.1",
+    "boxen": "^7.1.1",
+    "gradient-string": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}

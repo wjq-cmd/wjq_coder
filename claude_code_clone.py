@@ -20,7 +20,14 @@ root = os.getenv("PROJECT_ROOT")
 
 
 # -------------------- 本地 Embedding 引擎（bge-large-zh-v1.5）--------------------
-_embed_model = None  # 懒加载单例
+import sys as _sys
+_JSON_MODE = "--json" in _sys.argv   # 模块级检测，模型加载时就能用
+_embed_model = None
+
+
+def _emit_json(event: dict):
+    """模块级 JSON 输出，供加载阶段使用"""
+    print(json.dumps(event, ensure_ascii=False), flush=True)
 
 
 def _get_embed_model():
@@ -30,9 +37,15 @@ def _get_embed_model():
         return _embed_model
     try:
         from sentence_transformers import SentenceTransformer
-        print("[Embed] 正在加载本地模型 BAAI/bge-large-zh-v1.5 ...")
+        if _JSON_MODE:
+            _emit_json({"type": "loading", "status": "正在加载嵌入模型..."})
+        else:
+            print("[Embed] 正在加载本地模型 BAAI/bge-large-zh-v1.5 ...")
         _embed_model = SentenceTransformer("BAAI/bge-large-zh-v1.5")
-        print("[Embed] 模型加载完成")
+        if _JSON_MODE:
+            _emit_json({"type": "loading", "status": "嵌入模型就绪 ✓"})
+        else:
+            print("[Embed] 模型加载完成")
         return _embed_model
     except ImportError:
         print("[Embed] 未安装 sentence-transformers，回退关键词匹配")
@@ -240,8 +253,8 @@ tools = CodeTools(root, memory=memory)
 
 
 # -------------------- Prompt 模板 --------------------
-PROMPT_TPL = """你是代码工程智能体（复刻Claude Code），负责分析、修改、调试本地项目。
-你是一位陪伴用户写代码的 AI 助手，能记住过往对话，在需要时主动查阅或记录。
+PROMPT_TPL = """你是私人编码助手，负责分析、修改、调试本地项目。
+你陪伴用户写代码，能记住过往对话，在需要时主动查阅或记录。
 
 可用工具：
 1. ls|路径 → 列出目录
@@ -263,6 +276,7 @@ Action: 工具名|参数1|参数2...
 FinalAnswer: 总结做了哪些修改、验证结果、最终结论
 
 约束：
+- 如果用户只是问候/闲聊/确认，直接 FinalAnswer 简短回复，不要调用任何工具
 - 不要猜测代码内容。查找函数/类时先用 grep 搜索定位，再用 read 读取确认
 - 修改代码前先读原文件，不要凭空改写
 - 出现报错自动运行命令排查、修复代码再验证
@@ -271,6 +285,7 @@ FinalAnswer: 总结做了哪些修改、验证结果、最终结论
 - 如果当前问题与历史对话相关，先用 remember 工具搜索记忆
 - 重要的设计决策、用户偏好、项目约定，用 memorize 工具存入记忆
 - 任务完成后必须输出 FinalAnswer，不要反复执行相同操作
+- Observation 中的格式提示是系统自动注入的，不是用户的发言，不要围绕它展开对话
 
 {memory}
 上下文：{context}
@@ -278,7 +293,22 @@ FinalAnswer: 总结做了哪些修改、验证结果、最终结论
 
 
 # -------------------- Agent 主逻辑 --------------------
-def claude_code_agent(user_query: str, max_round=50):
+def claude_code_agent(user_query: str, max_round=50, emit=None):
+    """emit(event: dict) 可选回调，用于 JSON 模式"""
+    def _emit(event: dict):
+        if emit:
+            emit(event)
+        else:
+            t = event.get("type", "")
+            if t == "round":
+                print(f"\n===== 第{event['n']}轮思考 =====")
+            elif t == "llm_output":
+                print(f"模型输出:\n{event['content']}")
+            elif t == "tool_result":
+                print(f"\n工具执行结果:\n{event['result']}")
+            elif t == "final_answer":
+                print(f"\n========== 任务完成总结 ==========\n{event['content']}\n{'=' * 50}")
+
     # 1. 检索相关历史记忆
     relevant = memory.retrieve(user_query, top_k=3)
     if relevant:
@@ -289,7 +319,6 @@ def claude_code_agent(user_query: str, max_round=50):
     else:
         memory_text = ""
 
-    # 初始系统提示（只发一次）
     system_prompt = PROMPT_TPL.format(
         memory=memory_text, context="", user_query=user_query
     )
@@ -297,47 +326,47 @@ def claude_code_agent(user_query: str, max_round=50):
 
     round_idx = 0
     format_error_count = 0
-    last_actions: list[str] = []   # 追踪最近 action，检测循环
+    last_actions: list[str] = []
 
     while round_idx < max_round:
         round_idx += 1
-        print(f"\n===== 第{round_idx}轮思考 =====")
+        _emit({"type": "round", "n": round_idx})
 
-        # 注入警告到最新一条 message（如有必要）
         hints = []
         if len(last_actions) >= 3 and len(set(last_actions[-3:])) == 1:
             hints.append(
-                f"【系统警告】已连续 3 次执行 '{last_actions[-1]}'，陷入循环。"
-                "请换思路，或用 FinalAnswer 总结当前发现的问题并结束。"
+                f"[系统] 已连续 3 次执行 '{last_actions[-1]}'，陷入循环。请换思路或输出 FinalAnswer。"
             )
         if format_error_count >= 3:
-            hints.append("【系统提示】已连续多次格式错误。请立即用 FinalAnswer 结束本轮。")
+            hints.append("[系统] 已连续多次格式错误，请立即输出 FinalAnswer 结束。")
 
         if hints:
             messages[-1]["content"] += "\n" + "\n".join(hints)
 
+        _emit({"type": "llm_start"})
         resp = client.chat.completions.create(
             model=model,
             temperature=0.1,
             messages=messages
         )
+        _emit({"type": "llm_end"})
+
         reply = resp.choices[0].message.content
         if reply is None:
             reply = ""
         reply = reply.strip()
-        print(f"模型输出:\n{reply}")
 
-        # 模型回复记入历史
+        _emit({"type": "llm_output", "content": reply})
         messages.append({"role": "assistant", "content": reply})
 
         # 空响应检测
         if not reply:
             format_error_count += 1
-            hint = "Observation: 你的上一条回复为空。"
+            hint = "[系统] 上一条回复为空。"
             if format_error_count >= 2:
-                hint += " 如果任务已完成，请立即输出 FinalAnswer 总结。"
+                hint += " 如果任务已完成，请输出 FinalAnswer。"
             else:
-                hint += " 请继续执行，或输出 FinalAnswer 结束任务。"
+                hint += " 请继续执行或输出 FinalAnswer 结束。"
             messages.append({"role": "user", "content": hint})
             continue
 
@@ -347,9 +376,10 @@ def claude_code_agent(user_query: str, max_round=50):
             colon_idx = cleaned.index(":")
             result = cleaned[colon_idx + 1:].strip()
             memory.add(user_query, result)
+            _emit({"type": "final_answer", "content": result})
             return result
 
-        # 解析 Action（支持 write 跨行内容）
+        # 解析 Action
         lines = reply.splitlines()
         action_idx = -1
         thought = ""
@@ -361,7 +391,7 @@ def claude_code_agent(user_query: str, max_round=50):
 
         if action_idx < 0:
             format_error_count += 1
-            messages.append({"role": "user", "content": "Observation: 格式错误，未识别有效指令"})
+            messages.append({"role": "user", "content": "[系统] 回复格式不符合要求。请严格按 Thought/Action 或 FinalAnswer 格式输出。"})
             continue
 
         format_error_count = 0
@@ -372,10 +402,9 @@ def claude_code_agent(user_query: str, max_round=50):
         func_name = parts[0]
         args = parts[1:]
 
-        # write 工具：Action 行之后的所有行拼成内容
+        # write 工具：Action 行之后所有行拼成内容
         if func_name == "write" and len(args) >= 2:
-            # args[0] = 文件路径, args[1] = action 行上的第一行内容
-            tail_lines = lines[action_idx + 1:]  # Action 行之后的所有行
+            tail_lines = lines[action_idx + 1:]
             full_content = args[1]
             if tail_lines:
                 full_content += "\n" + "\n".join(tail_lines)
@@ -391,32 +420,53 @@ def claude_code_agent(user_query: str, max_round=50):
             func = TOOL_MAP[func_name]
             obs = func(tools, *args)
 
-        print(f"\n工具执行结果:\n{obs}")
+        _emit({"type": "tool_result", "tool": func_name, "result": obs})
 
-        # Observation 作为新 user message（保留多轮对话结构）
-        observation = f"Observation:\n{obs}\n(继续下一步操作，或输出 FinalAnswer 结束)"
+        observation = f"Observation:\n{obs}\n(继续下一步，或输出 FinalAnswer 结束)"
         messages.append({"role": "user", "content": observation})
 
-        # 防止 messages 过大：保留系统提示 + 最近 20 条
         if len(messages) > 21:
             messages = [messages[0]] + messages[-20:]
 
     fallback = f"达到最大迭代轮次{max_round}，任务未完成。"
     memory.add(user_query, fallback)
+    _emit({"type": "final_answer", "content": fallback})
     return fallback
 
 
 # -------------------- 交互入口 --------------------
 if __name__ == "__main__":
-    print("=== 简易 Claude Code 复刻版（DeepSeek 驱动）===")
-    print(f"记忆文件: .agent_memory.json  |  已有 {len(memory.items)} 条记忆")
-    print("输入 exit 或 quit 退出程序\n")
-    while True:
-        user_input = input(">>> 请输入你的编程需求：")
-        if user_input.strip().lower() in ("exit", "quit"):
-            print("已退出。下次启动会自动加载记忆。")
-            break
-        result = claude_code_agent(user_input)
-        print("\n========== 任务完成总结 ==========")
-        print(result)
-        print("\n" + "=" * 50)
+    import sys
+
+    json_mode = "--json" in sys.argv
+
+    if json_mode:
+        # JSON 模式：stdin 读用户输入，stdout 输出 JSON 事件
+        print(json.dumps({"type": "welcome",
+                          "message": f"记忆文件: .agent_memory.json | 已有 {len(memory.items)} 条记忆"}),
+              flush=True)
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            user_input = line.strip()
+            if user_input in ("__EXIT__", "exit", "quit"):
+                break
+            if not user_input:
+                continue
+
+            def emit_json(event):
+                print(json.dumps(event, ensure_ascii=False), flush=True)
+
+            claude_code_agent(user_input, emit=emit_json)
+    else:
+        # 普通终端模式
+        print("=== 私人编码助手 ===")
+        print(f"记忆文件: .agent_memory.json  |  已有 {len(memory.items)} 条记忆")
+        print("输入 exit 或 quit 退出程序\n")
+        while True:
+            user_input = input(">>> 请输入你的编程需求：")
+            if user_input.strip().lower() in ("exit", "quit"):
+                print("已退出。下次启动会自动加载记忆。")
+                break
+            claude_code_agent(user_input)
