@@ -199,8 +199,15 @@ async function main() {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
+  // SIGINT 处理：通知 Python 退出后再关自身
+  process.on("SIGINT", () => {
+    spinnerStop();
+    proc.stdin!.write("__EXIT__\n");
+    setTimeout(() => process.exit(0), 300); // 给 Python 时间写盘
+  });
+
   let currentResolve: (() => void) | null = null;
-  let toolInProgress: string | null = null; // 当前正在等待结果的工具
+  let toolInProgress: string | null = null;
 
   // 读 stdout JSON 事件
   let buf = "";

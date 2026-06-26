@@ -19,10 +19,10 @@ model = os.getenv("LLM_MODEL")
 root = os.getenv("PROJECT_ROOT")
 
 
-# -------------------- 本地 Embedding 引擎（bge-large-zh-v1.5）--------------------
+# -------------------- Embedding 引擎（DeepSeek API 云端向量）--------------------
 import sys as _sys
-_JSON_MODE = "--json" in _sys.argv   # 模块级检测，模型加载时就能用
-_embed_model = None
+_JSON_MODE = "--json" in _sys.argv
+_EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 
 def _emit_json(event: dict):
@@ -30,242 +30,142 @@ def _emit_json(event: dict):
     print(json.dumps(event, ensure_ascii=False), flush=True)
 
 
-def _get_embed_model():
-    """懒加载 BGE 模型，只加载一次"""
-    global _embed_model
-    if _embed_model is not None:
-        return _embed_model
-    try:
-        from sentence_transformers import SentenceTransformer
-        if _JSON_MODE:
-            _emit_json({"type": "loading", "status": "正在加载嵌入模型..."})
-        else:
-            print("[Embed] 正在加载本地模型 BAAI/bge-large-zh-v1.5 ...")
-        _embed_model = SentenceTransformer("BAAI/bge-large-zh-v1.5")
-        if _JSON_MODE:
-            _emit_json({"type": "loading", "status": "嵌入模型就绪 ✓"})
-        else:
-            print("[Embed] 模型加载完成")
-        return _embed_model
-    except ImportError:
-        print("[Embed] 未安装 sentence-transformers，回退关键词匹配")
-        print("[Embed] 安装命令: pip install sentence-transformers")
-        return None
-    except Exception as e:
-        print(f"[Embed] 模型加载失败: {e}，回退关键词匹配")
-        return None
-
-
 def _embed_text(text: str) -> list[float] | None:
-    """用本地 BGE 模型将文本转为向量"""
-    m = _get_embed_model()
-    if m is None:
-        return None
+    """调用云端 Embedding API 将文本转为向量，失败返回 None（调用方决定回退策略）"""
     try:
-        # BGE 模型建议对 query 加前缀以提升效果
-        return m.encode(text, normalize_embeddings=True).tolist()
-    except Exception as e:
-        print(f"[Embed] 编码失败: {e}")
+        resp = client.embeddings.create(model=_EMBED_MODEL, input=text)
+        return resp.data[0].embedding
+    except Exception:
         return None
 
 
-# -------------------- RAG 记忆系统 --------------------
-class RAGMemory:
-    """基于 bge-large-zh-v1.5 本地 embedding 的长期记忆，带写入去重 + 懒保存"""
+# -------------------- ChatGPT 风格记忆系统 --------------------
+class ChatGPTMemory:
+    """结构化事实库 memory.json + 自动提取 + 斜杠指令管理"""
 
-    STOP_WORDS = set("的了吗呢吧啊是和在也都很要去说会对为及与或但而".replace(" ", ""))
-    DEDUP_THRESHOLD = 0.88     # 相似度超过此值视为重复
-    SAVE_BATCH = 5             # 每 N 次 add 写一次盘
-    SAVE_INTERVAL = 30         # 或每 30 秒写一次盘
-
-    def __init__(self, storage_path: str = ".agent_memory.json"):
-        self.storage_path = Path(storage_path)
-        self.items: list[dict] = []
+    def __init__(self, storage_dir: str = ".agent_memory"):
+        self.dir = Path(storage_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.dir / "memory.json"
+        self.facts: list[dict] = []   # {id, content, source, created}
         self._id_counter = 0
-        self._has_embedder = False
-        self._dirty = False              # 是否有未持久化的变更
-        self._add_since_save = 0         # 上次保存后新增条数
-        self._last_save_time = time.time()
-        self._dedup_skipped = 0          # 统计跳过的重复条数
         self.load()
-        atexit.register(self._on_exit)   # 退出时兜底保存
 
-    # ---------- 关键词分词（回退用）----------
-    @classmethod
-    def _tokenize(cls, text: str) -> list[str]:
-        tokens = re.findall(r"[一-鿿]+|[a-zA-Z]+|\d+", text.lower())
-        return [t for t in tokens if t not in cls.STOP_WORDS and len(t) > 1]
+    # ---- 基础 CRUD ----
+    def add_fact(self, content: str, source: str = "auto") -> int:
+        """添加一条事实，返回 id"""
+        fid = self._id_counter
+        self._id_counter += 1
+        fact = {
+            "id": fid,
+            "content": content.strip(),
+            "source": source,
+            "created": time.strftime("%Y-%m-%d %H:%M")
+        }
+        self.facts.append(fact)
+        self.save()
+        return fid
 
-    @classmethod
-    def _keyword_score(cls, query: str, text: str) -> float:
-        q_tokens = cls._tokenize(query)
-        t_tokens = cls._tokenize(text)
-        if not q_tokens:
-            return 0.0
-        q_set = set(q_tokens)
-        t_set = set(t_tokens)
-        intersection = q_set & t_set
-        union = q_set | t_set
-        jaccard = len(intersection) / len(union) if union else 0.0
-        q_bigrams = set(zip(q_tokens, q_tokens[1:])) if len(q_tokens) >= 2 else set()
-        t_bigrams = set(zip(t_tokens, t_tokens[1:])) if len(t_tokens) >= 2 else set()
-        bigram_score = len(q_bigrams & t_bigrams) / len(q_bigrams) if q_bigrams else 0.0
-        coverage = len(intersection) / len(q_set)
-        return 0.35 * jaccard + 0.25 * bigram_score + 0.40 * coverage
-
-    @staticmethod
-    def _cosine(a: list[float], b: list[float]) -> float:
-        dot = sum(x * y for x, y in zip(a, b))
-        na = math.sqrt(sum(x * x for x in a))
-        nb = math.sqrt(sum(y * y for y in b))
-        return dot / (na * nb) if na and nb else 0.0
-
-    # ---------- 去重判断 ----------
-    def _find_duplicate(self, query: str, answer: str, emb: list[float] | None) -> bool:
-        """检查是否与已有记忆高度重复，只看最近的 10 条"""
-        text = query + " " + answer
-        candidates = self.items[-10:]  # 只看最近 10 条，O(10) 足够
-        for item in candidates:
-            if emb is not None and item.get("embedding"):
-                score = self._cosine(emb, item["embedding"])
-            else:
-                score = self._keyword_score(text, item["query"] + " " + item["answer"])
-            if score >= self.DEDUP_THRESHOLD:
+    def remove_fact(self, fid: int) -> bool:
+        for f in self.facts:
+            if f["id"] == fid:
+                self.facts.remove(f)
+                self.save()
                 return True
         return False
 
-    # ---------- 存取接口 ----------
-    def add(self, query: str, answer: str, force: bool = False):
-        """写入一条记忆，自动去重 + 懒保存。force=True 跳过去重"""
-        text = f"问: {query}\n答: {answer}"
-        emb = _embed_text(text) if self._has_embedder else None
+    def clear(self):
+        self.facts = []
+        self.save()
 
-        if not force and self._find_duplicate(query, answer, emb):
-            self._dedup_skipped += 1
-            return  # 重复，跳过
+    def get_context(self) -> str:
+        """返回拼入 System Prompt 的记忆文本"""
+        if not self.facts:
+            return ""
+        lines = ["【关于此用户】"]
+        for f in self.facts:
+            lines.append(f"- {f['content']}  (id:{f['id']})")
+        return "\n".join(lines)
 
-        item = {
-            "id": self._id_counter,
-            "query": query,
-            "answer": answer,
-            "embedding": emb,
-            "timestamp": time.time()
-        }
-        self._id_counter += 1
-        self.items.append(item)
-        self._dirty = True
-        self._add_since_save += 1
-
-        if self._add_since_save >= self.SAVE_BATCH or \
-           (time.time() - self._last_save_time) >= self.SAVE_INTERVAL:
-            self.save()
-
-    def retrieve(self, query: str, top_k: int = 3) -> list[dict]:
-        if not self.items:
-            return []
-
-        if self._has_embedder:
-            q_emb = _embed_text(query)
-            if q_emb is None:
-                return self._keyword_retrieve(query, top_k)
-            scored = []
-            for item in self.items:
-                if item.get("embedding"):
-                    score = self._cosine(q_emb, item["embedding"])
-                else:
-                    score = self._keyword_score(query, item["query"] + " " + item["answer"])
-                scored.append((score, item))
-        else:
-            return self._keyword_retrieve(query, top_k)
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [
-            {"score": round(s, 3), "query": it["query"], "answer": it["answer"]}
-            for s, it in scored[:top_k] if s > 0.3
-        ]
-
-    def _keyword_retrieve(self, query: str, top_k: int) -> list[dict]:
-        scored = []
-        for item in self.items:
-            score = self._keyword_score(query, item["query"] + " " + item["answer"])
-            scored.append((score, item))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [
-            {"score": round(s, 3), "query": it["query"], "answer": it["answer"]}
-            for s, it in scored[:top_k] if s > 0.05
-        ]
-
-    # ---------- 持久化 ----------
-    def save(self, force: bool = False):
-        """写盘。force=True 忽略 dirty 检查"""
-        if not force and not self._dirty:
-            return
-        data = {"id_counter": self._id_counter, "items": self.items}
-        self.storage_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-        self._dirty = False
-        self._add_since_save = 0
-        self._last_save_time = time.time()
+    # ---- 持久化 ----
+    def save(self):
+        data = {"id_counter": self._id_counter, "facts": self.facts}
+        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load(self):
-        if self.storage_path.is_file():
+        if self.path.is_file():
             try:
-                data = json.loads(self.storage_path.read_text(encoding="utf-8"))
+                data = json.loads(self.path.read_text(encoding="utf-8"))
                 self._id_counter = data.get("id_counter", 0)
-                self.items = data.get("items", [])
-                self._has_embedder = _get_embed_model() is not None
-                self._migrate_embeddings()
-                print(f"[RAG] 已加载 {len(self.items)} 条记忆"
-                      f"(embedding: {'✓' if self._has_embedder else '✗ 关键词回退'})")
-            except Exception as e:
-                print(f"[RAG] 加载记忆文件失败: {e}")
-                self.items = []
-        else:
-            self._has_embedder = _get_embed_model() is not None
+                self.facts = data.get("facts", [])
+            except Exception:
+                self.facts = []
+        if not _JSON_MODE:
+            print(f"[Mem] 已加载 {len(self.facts)} 条事实记忆")
 
-    def _migrate_embeddings(self):
-        """给加载的旧数据中没有 embedding 的条目补上向量"""
-        if not self._has_embedder:
+    # ---- 自动提取 ----
+    def auto_extract(self, user_query: str, assistant_reply: str):
+        """对话结束后调用 LLM 自动提取关键事实"""
+        if len(self.facts) >= 50:  # 防止膨胀
             return
-        need_migrate = [it for it in self.items if it.get("embedding") is None]
-        if not need_migrate:
-            return
-        print(f"[RAG] 正在为 {len(need_migrate)} 条旧记忆生成 embedding...")
-        for it in need_migrate:
-            text = f"问: {it['query']}\n答: {it['answer']}"
-            it["embedding"] = _embed_text(text)
-        self.save(force=True)
-        print("[RAG] 迁移完成")
+        try:
+            prompt = (
+                "从以下对话中提取关于用户的 1-2 条关键事实（偏好、项目、习惯、决策等）。"
+                "每条不超过 30 字。用第三人称描述。如果没有值得长期记住的事实，回复 NONE。\n"
+                f"用户: {user_query[:300]}\n"
+                f"助手: {assistant_reply[:500]}\n"
+                "输出格式（每条一行）:\n- 事实1\n- 事实2"
+            )
+            resp = client.chat.completions.create(
+                model=model, temperature=0.2,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = resp.choices[0].message.content.strip()
+            if text and text.upper() != "NONE":
+                for line in text.split("\n"):
+                    line = line.strip().lstrip("- ").strip()
+                    if line and len(line) > 3:
+                        # 去重：相似度过高则跳过
+                        if not self._is_duplicate(line):
+                            self.add_fact(line, source="auto")
+        except Exception:
+            pass  # 静默失败，不影响主流程
 
-    def _on_exit(self):
-        """进程退出时兜底写盘"""
-        if self._dirty:
-            self.save(force=True)
-            print(f"[RAG] 退出时保存 {len(self.items)} 条记忆"
-                  f"(已跳过 {self._dedup_skipped} 条重复)")
+    def _is_duplicate(self, content: str) -> bool:
+        """简单的 Jaccard 去重"""
+        c_tokens = set(re.findall(r"[一-鿿]+|[a-zA-Z]+|\d+", content.lower()))
+        if not c_tokens:
+            return False
+        for f in self.facts:
+            f_tokens = set(re.findall(r"[一-鿿]+|[a-zA-Z]+|\d+", f["content"].lower()))
+            if not f_tokens:
+                continue
+            overlap = len(c_tokens & f_tokens) / len(c_tokens | f_tokens)
+            if overlap > 0.6:
+                return True
+        return False
 
 
 # -------------------- 记忆实例 --------------------
-memory = RAGMemory(".agent_memory.json")
+memory = ChatGPTMemory(".agent_memory")
+
+if not _JSON_MODE:
+    print(f"[Init] 记忆系统: ChatGPT 风格结构化事实库")
+
 tools = CodeTools(root, memory=memory)
 
 
 # -------------------- Prompt 模板 --------------------
 PROMPT_TPL = """你是私人编码助手，负责分析、修改、调试本地项目。
-你陪伴用户写代码，能记住过往对话，在需要时主动查阅或记录。
 
 可用工具：
 1. ls|路径 → 列出目录
 2. read|文件相对路径 → 读取代码
-3. write|文件路径|第一行代码 → 写入/修改文件（后续行直接接代码，无需重复Action）
+3. write|文件路径|第一行代码 → 写入/修改文件（后续行直接接代码）
 4. cmd|命令字符串 → 执行终端命令
-5. grep|正则表达式|glob过滤(可选) → 按模式搜索代码内容
+5. grep|正则表达式|glob过滤 → 按模式搜索代码
 6. batch_read|glob模式 → 批量读取匹配文件
-7. code_structure|py文件路径 → 解析Python文件结构(类/函数/导入)
-8. remember|查询关键词 → 搜索历史记忆（跨对话）
-9. memorize|要记住的内容 → 手动存入长期记忆
+7. code_structure|py文件路径 → 解析Python文件结构
 
 输出格式严格二选一：
 1. 需要操作工具：
@@ -276,24 +176,20 @@ Action: 工具名|参数1|参数2...
 FinalAnswer: 总结做了哪些修改、验证结果、最终结论
 
 约束：
-- 如果用户只是问候/闲聊/确认，直接 FinalAnswer 简短回复，不要调用任何工具
-- 不要猜测代码内容。查找函数/类时先用 grep 搜索定位，再用 read 读取确认
+- 如果用户只是问候/闲聊，直接 FinalAnswer 简短回复
 - 修改代码前先读原文件，不要凭空改写
 - 出现报错自动运行命令排查、修复代码再验证
 - 不要一次性修改大量文件，小步迭代
 - 不要超出项目根目录访问文件
-- 如果当前问题与历史对话相关，先用 remember 工具搜索记忆
-- 重要的设计决策、用户偏好、项目约定，用 memorize 工具存入记忆
-- 任务完成后必须输出 FinalAnswer，不要反复执行相同操作
-- Observation 中的格式提示是系统自动注入的，不是用户的发言，不要围绕它展开对话
+- 任务完成后必须输出 FinalAnswer
+- Observation 中的系统提示不是用户的发言，不要围绕它展开对话
 
 {memory}
-上下文：{context}
 用户需求：{user_query}"""
 
 
 # -------------------- Agent 主逻辑 --------------------
-def claude_code_agent(user_query: str, max_round=50, emit=None):
+def claude_code_agent(user_query: str, max_round=15, emit=None):
     """emit(event: dict) 可选回调，用于 JSON 模式"""
     def _emit(event: dict):
         if emit:
@@ -309,18 +205,11 @@ def claude_code_agent(user_query: str, max_round=50, emit=None):
             elif t == "final_answer":
                 print(f"\n========== 任务完成总结 ==========\n{event['content']}\n{'=' * 50}")
 
-    # 1. 检索相关历史记忆
-    relevant = memory.retrieve(user_query, top_k=3)
-    if relevant:
-        memory_text = "【历史相关记忆】\n" + "\n".join(
-            f"- [{m['score']:.2f}] 问: {m['query']}\n  答: {m['answer'][:300]}"
-            for m in relevant
-        )
-    else:
-        memory_text = ""
+    # 注入长期记忆事实到 System Prompt
+    memory_text = memory.get_context()
 
     system_prompt = PROMPT_TPL.format(
-        memory=memory_text, context="", user_query=user_query
+        memory=memory_text, user_query=user_query
     )
     messages = [{"role": "user", "content": system_prompt}]
 
@@ -370,34 +259,55 @@ def claude_code_agent(user_query: str, max_round=50, emit=None):
             messages.append({"role": "user", "content": hint})
             continue
 
-        # 任务结束
+        # 任务结束（放宽匹配：大小写不敏感、FinalAnswer/Final Answer/最终回答 均可）
         cleaned = reply.lstrip()
-        if cleaned.startswith("FinalAnswer") and ":" in cleaned.split("\n")[0]:
-            colon_idx = cleaned.index(":")
-            result = cleaned[colon_idx + 1:].strip()
-            memory.add(user_query, result)
+        first_line = cleaned.split("\n")[0].lower().replace(" ", "").replace("：", ":")
+        is_final = any(
+            first_line.startswith(p) for p in (
+                "finalanswer:", "final_answer:", "finalanswer", "最终回答:", "最终回答",
+            )
+        )
+        if is_final:
+            for ch in (":", "：", "\n"):
+                if ch in cleaned:
+                    result = cleaned.split(ch, 1)[1].strip()
+                    break
+            else:
+                result = cleaned
+            # 自动提取关键事实存入 memory.json
+            memory.auto_extract(user_query, result)
             _emit({"type": "final_answer", "content": result})
             return result
 
-        # 解析 Action
+        # 解析 Action（大小写不敏感）
         lines = reply.splitlines()
         action_idx = -1
         thought = ""
         for i, line in enumerate(lines):
-            if line.startswith("Thought:"):
+            lower_line = line.lower().replace("：", ":")
+            if lower_line.startswith("thought:"):
                 thought = line
-            if line.startswith("Action:"):
+            if lower_line.startswith("action:"):
                 action_idx = i
+
+        # 超过 10 轮还没结果 → 强制收尾
+        if round_idx >= 10:
+            messages.append({"role": "user", "content": "[系统] 已超过 10 轮，请立即输出 FinalAnswer 总结当前状态并结束。"})
+            continue
 
         if action_idx < 0:
             format_error_count += 1
-            messages.append({"role": "user", "content": "[系统] 回复格式不符合要求。请严格按 Thought/Action 或 FinalAnswer 格式输出。"})
+            msg = "[系统] 回复格式不符合要求。请按 Thought/Action 或 FinalAnswer 格式输出。"
+            if format_error_count >= 5:
+                msg += " 已多次格式错误，如任务完成请直接输出 FinalAnswer。"
+            messages.append({"role": "user", "content": msg})
             continue
 
         format_error_count = 0
 
         action_line = lines[action_idx]
-        action_content = action_line.replace("Action:", "").strip()
+        # 大小写不敏感去掉前缀
+        action_content = re.sub(r"action\s*:\s*", "", action_line, flags=re.IGNORECASE).strip()
         parts = action_content.split("|")
         func_name = parts[0]
         args = parts[1:]
@@ -425,8 +335,24 @@ def claude_code_agent(user_query: str, max_round=50, emit=None):
         observation = f"Observation:\n{obs}\n(继续下一步，或输出 FinalAnswer 结束)"
         messages.append({"role": "user", "content": observation})
 
-        if len(messages) > 21:
-            messages = [messages[0]] + messages[-20:]
+        # 防止上下文爆炸：超 16 条时压缩早期消息
+        if len(messages) > 16:
+            # 保留系统提示 + 最后 10 条
+            messages = [messages[0]] + messages[-10:]
+        # 超 20 条进一步压缩：调用 LLM 摘要早期对话
+        if len(messages) > 20:
+            try:
+                summary_prompt = "将以下对话历史压缩为一段简短摘要（不超过 100 字）：\n" + \
+                    "\n".join(m["content"][:200] for m in messages[1:6])
+                resp = client.chat.completions.create(
+                    model=model, temperature=0.1,
+                    messages=[{"role": "user", "content": summary_prompt}]
+                )
+                summary = resp.choices[0].message.content.strip()
+                messages = [messages[0],
+                            {"role": "user", "content": f"[历史摘要] {summary}"}] + messages[-8:]
+            except Exception:
+                messages = [messages[0]] + messages[-10:]
 
     fallback = f"达到最大迭代轮次{max_round}，任务未完成。"
     memory.add(user_query, fallback)
@@ -437,13 +363,52 @@ def claude_code_agent(user_query: str, max_round=50, emit=None):
 # -------------------- 交互入口 --------------------
 if __name__ == "__main__":
     import sys
+    import signal as _signal
+
+    # 注册信号处理：Ctrl+C 时保存记忆后退出
+    def _handle_exit(signum=None, frame=None):
+        """确保退出时记忆写盘"""
+        try:
+            memory.save()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    _signal.signal(_signal.SIGINT, _handle_exit)
+    _signal.signal(_signal.SIGTERM, _handle_exit)
 
     json_mode = "--json" in sys.argv
+
+    def _handle_slash(user_input: str) -> str | None:
+        """处理斜杠指令，返回响应文本；非指令返回 None"""
+        cmd = user_input.strip()
+        if cmd.startswith("/记住 "):
+            content = cmd[4:].strip()
+            fid = memory.add_fact(content, source="manual")
+            return f"✅ 已记住 (id:{fid}): {content}"
+        if cmd.startswith("/删除记忆 "):
+            try:
+                fid = int(cmd[6:].strip())
+                ok = memory.remove_fact(fid)
+                return f"{'✅ 已删除' if ok else '❌ 未找到'} id:{fid}"
+            except ValueError:
+                return "❌ 用法: /删除记忆 <id>"
+        if cmd in ("/查看记忆", "/记忆"):
+            if not memory.facts:
+                return "📝 暂无记忆。用 /记住 xxx 添加。"
+            lines = [f"📝 共 {len(memory.facts)} 条记忆:"]
+            for f in memory.facts:
+                lines.append(f"  [{f['id']}] {f['content']}  ({f['source']}, {f['created']})")
+            return "\n".join(lines)
+        if cmd in ("/清空记忆",):
+            memory.clear()
+            return "🗑️ 已清空全部记忆。"
+        return None
 
     if json_mode:
         # JSON 模式：stdin 读用户输入，stdout 输出 JSON 事件
         print(json.dumps({"type": "welcome",
-                          "message": f"记忆文件: .agent_memory.json | 已有 {len(memory.items)} 条记忆"}),
+                          "message": f"已加载 {len(memory.facts)} 条事实记忆"}),
               flush=True)
         while True:
             line = sys.stdin.readline()
@@ -455,6 +420,12 @@ if __name__ == "__main__":
             if not user_input:
                 continue
 
+            # 斜杠指令
+            slash_result = _handle_slash(user_input)
+            if slash_result is not None:
+                print(json.dumps({"type": "final_answer", "content": slash_result}), flush=True)
+                continue
+
             def emit_json(event):
                 print(json.dumps(event, ensure_ascii=False), flush=True)
 
@@ -462,11 +433,20 @@ if __name__ == "__main__":
     else:
         # 普通终端模式
         print("=== 私人编码助手 ===")
-        print(f"记忆文件: .agent_memory.json  |  已有 {len(memory.items)} 条记忆")
-        print("输入 exit 或 quit 退出程序\n")
+        print(f"已加载 {len(memory.facts)} 条事实记忆")
+        print("斜杠指令: /记住 /查看记忆 /删除记忆 /清空记忆")
+        print("输入 exit 或 quit 退出\n")
         while True:
-            user_input = input(">>> 请输入你的编程需求：")
-            if user_input.strip().lower() in ("exit", "quit"):
-                print("已退出。下次启动会自动加载记忆。")
+            user_input = input(">>> ").strip()
+            if user_input.lower() in ("exit", "quit"):
+                print("已退出。")
                 break
+            if not user_input:
+                continue
+
+            slash_result = _handle_slash(user_input)
+            if slash_result is not None:
+                print(slash_result)
+                continue
+
             claude_code_agent(user_input)

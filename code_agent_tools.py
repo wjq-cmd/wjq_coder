@@ -287,6 +287,4 @@ TOOL_MAP = {
     "grep":           CodeTools.grep,
     "batch_read":     CodeTools.batch_read,
     "code_structure": CodeTools.code_structure,
-    "remember":       CodeTools.memory_search,
-    "memorize":       CodeTools.memory_add,
 }
