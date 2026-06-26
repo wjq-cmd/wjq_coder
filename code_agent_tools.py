@@ -18,6 +18,10 @@ class CodeTools:
     def __init__(self, project_root: str, memory=None):
         self.root = Path(project_root).resolve()
         self.memory = memory
+        self._file_cache: dict[str, str] = {}  # 路径 → 内容，会话级缓存
+
+    def _cache_key(self, rel_path: str) -> str:
+        return str((self.root / rel_path).resolve())
 
     # ========== 基础工具 ==========
 
@@ -30,20 +34,29 @@ class CodeTools:
         return "\n".join(items) if items else "(空目录)"
 
     def read_file(self, rel_path: str) -> str:
-        """读取单个文件"""
+        """读取单个文件（优先命中缓存）"""
+        key = self._cache_key(rel_path)
+        if key in self._file_cache:
+            return self._file_cache[key]
         fp = self.root / rel_path
         if not fp.is_file():
             return f"文件不存在: {rel_path}"
         try:
-            return fp.read_text(encoding="utf-8")
+            content = fp.read_text(encoding="utf-8")
+            self._file_cache[key] = content
+            return content
         except Exception as e:
             return f"读取失败: {str(e)}"
 
     def diff_preview(self, rel_path: str, new_content: str) -> str:
-        """生成文件修改差异预览"""
+        """生成文件修改差异预览（优先用缓存里的旧版本）"""
         import difflib
+        key = self._cache_key(rel_path)
         fp = self.root / rel_path
-        old = fp.read_text(encoding="utf-8") if fp.is_file() else ""
+        # 缓存优先 → 磁盘兜底
+        old = self._file_cache.get(key)
+        if old is None:
+            old = fp.read_text(encoding="utf-8") if fp.is_file() else ""
         old_lines = old.splitlines(keepends=True)
         new_lines = new_content.splitlines(keepends=True)
         diff = difflib.unified_diff(
@@ -55,10 +68,12 @@ class CodeTools:
         return result if result else "(新文件，无差异)"
 
     def write_file(self, rel_path: str, content: str) -> str:
-        """覆写/新建文件"""
+        """覆写/新建文件，同步更新缓存"""
         fp = self.root / rel_path
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content, encoding="utf-8")
+        # 同步缓存：后续 read 直接拿最新版
+        self._file_cache[self._cache_key(rel_path)] = content
         return f"已写入文件: {rel_path}"
 
     def run_command(self, cmd: str) -> str:

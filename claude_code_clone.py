@@ -5,6 +5,7 @@ import math
 import re
 import time
 import atexit
+import threading
 from openai import OpenAI
 from pathlib import Path
 from code_agent_tools import CodeTools, TOOL_MAP
@@ -105,31 +106,34 @@ class ChatGPTMemory:
 
     # ---- 自动提取 ----
     def auto_extract(self, user_query: str, assistant_reply: str):
-        """对话结束后调用 LLM 自动提取关键事实"""
-        if len(self.facts) >= 50:  # 防止膨胀
+        """对话结束后后台线程提取事实，不阻塞主流程"""
+        if len(self.facts) >= 50:
             return
-        try:
-            prompt = (
-                "从以下对话中提取关于用户的 1-2 条关键事实（偏好、项目、习惯、决策等）。"
-                "每条不超过 30 字。用第三人称描述。如果没有值得长期记住的事实，回复 NONE。\n"
-                f"用户: {user_query[:300]}\n"
-                f"助手: {assistant_reply[:500]}\n"
-                "输出格式（每条一行）:\n- 事实1\n- 事实2"
-            )
-            resp = client.chat.completions.create(
-                model=model, temperature=0.2,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            text = resp.choices[0].message.content.strip()
-            if text and text.upper() != "NONE":
-                for line in text.split("\n"):
-                    line = line.strip().lstrip("- ").strip()
-                    if line and len(line) > 3:
-                        # 去重：相似度过高则跳过
-                        if not self._is_duplicate(line):
-                            self.add_fact(line, source="auto")
-        except Exception:
-            pass  # 静默失败，不影响主流程
+
+        def _run():
+            try:
+                prompt = (
+                    "从以下对话中提取关于用户的 1-2 条关键事实（偏好、项目、习惯、决策等）。"
+                    "每条不超过 30 字。用第三人称描述。如果没有值得长期记住的事实，回复 NONE。\n"
+                    f"用户: {user_query[:300]}\n"
+                    f"助手: {assistant_reply[:500]}\n"
+                    "输出格式（每条一行）:\n- 事实1\n- 事实2"
+                )
+                resp = client.chat.completions.create(
+                    model=model, temperature=0.2, timeout=10,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                text = resp.choices[0].message.content.strip()
+                if text and text.upper() != "NONE":
+                    for line in text.split("\n"):
+                        line = line.strip().lstrip("- ").strip()
+                        if line and len(line) > 3:
+                            if not self._is_duplicate(line):
+                                self.add_fact(line, source="auto")
+            except Exception:
+                pass  # 静默失败
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _is_duplicate(self, content: str) -> bool:
         """简单的 Jaccard 去重"""
@@ -177,7 +181,7 @@ FinalAnswer: 总结做了哪些修改、验证结果、最终结论
 
 约束：
 - 如果用户只是问候/闲聊，直接 FinalAnswer 简短回复
-- 修改代码前先读原文件，不要凭空改写
+- 文件内容会话级缓存：同一文件只读一次，后续直接用已知内容，不要重复 read
 - 出现报错自动运行命令排查、修复代码再验证
 - 不要一次性修改大量文件，小步迭代
 - 不要超出项目根目录访问文件
@@ -348,11 +352,36 @@ def claude_code_agent(user_query: str, max_round=15, emit=None, confirm_callback
         observation = f"Observation:\n{obs}\n(继续下一步，或输出 FinalAnswer 结束)"
         messages.append({"role": "user", "content": observation})
 
-        # 防止上下文爆炸：超 16 条时压缩早期消息
+        # 防止上下文爆炸：超 16 条时压缩早期消息，但保留读文件记录
         if len(messages) > 16:
-            # 保留系统提示 + 最后 10 条
-            messages = [messages[0]] + messages[-10:]
-        # 超 20 条进一步压缩：调用 LLM 摘要早期对话
+            # 从即将丢弃的消息中提取 file read 结果
+            old_slice = messages[1:-10]
+            file_snapshots: dict[str, str] = {}
+            for i, m in enumerate(old_slice):
+                if m.get("role") != "user":
+                    continue
+                content = m.get("content", "")
+                if not content.startswith("Observation:"):
+                    continue
+                if any(err in content for err in ("文件不存在", "错误", "格式", "[系统]")):
+                    continue
+                # 找前一条 assistant 消息确认是 read 工具
+                for j in range(i - 1, -1, -1):
+                    prev = old_slice[j]
+                    if prev.get("role") == "assistant" and "Action: read|" in prev.get("content", ""):
+                        fname = prev["content"].split("read|")[1].split("\n")[0].split("|")[0].strip()
+                        file_snapshots[fname] = content[:500]
+                        break
+
+            if file_snapshots:
+                snapshot_text = "【已读文件缓存，会话内有效】\n" + "\n".join(
+                    f"--- {f} ---\n{c[:300]}" for f, c in file_snapshots.items()
+                )
+                messages = [messages[0],
+                            {"role": "user", "content": snapshot_text}] + messages[-10:]
+            else:
+                messages = [messages[0]] + messages[-10:]
+
         if len(messages) > 20:
             try:
                 summary_prompt = "将以下对话历史压缩为一段简短摘要（不超过 100 字）：\n" + \

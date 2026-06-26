@@ -319,6 +319,7 @@ async function main() {
         return new Promise((r) => { inputResolve = r; });
     }
     while (true) {
+        inputBuf = ""; // 清掉残留（如 confirm_edit 后的多余输入）
         const input = await ask();
         if (!input)
             continue;
