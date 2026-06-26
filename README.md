@@ -32,6 +32,8 @@
 └──────────────────────────────────────────────┘
 ```
 
+![wjq_coder 运行截图](test02.png)
+
 ## 快速开始
 
 ### 1. 配置 `.env`
@@ -97,6 +99,8 @@ cd tui && npm install && npm start
 1. 用 `difflib` 生成彩色 diff 预览
 2. 弹出 `Allow this edit? [y/n]` 交互确认
 3. 写入后同步更新会话级文件缓存（避免读到旧版本）
+
+![wjq_coder 运行截图](test.png)
 
 ## 上下文管理
 

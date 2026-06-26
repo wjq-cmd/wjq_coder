@@ -1,47 +1,4 @@
 {
-  "id_counter": 9,
-  "facts": [
-    {
-      "id": 2,
-      "content": "NONE",
-      "source": "auto",
-      "created": "2026-06-26 11:25"
-    },
-    {
-      "id": 3,
-      "content": "用户希望增强文件加密的复杂性。",
-      "source": "auto",
-      "created": "2026-06-26 11:37"
-    },
-    {
-      "id": 4,
-      "content": "用户有一个Python文件路径为c:\\Users\\30869\\AppData\\agent\\hello.py。",
-      "source": "auto",
-      "created": "2026-06-26 11:37"
-    },
-    {
-      "id": 5,
-      "content": "用户正在实现对称加密功能（使用Fernet）。",
-      "source": "auto",
-      "created": "2026-06-26 11:38"
-    },
-    {
-      "id": 6,
-      "content": "用户偏好实现多层编码加密方案。",
-      "source": "auto",
-      "created": "2026-06-26 11:38"
-    },
-    {
-      "id": 7,
-      "content": "用户要求对文本\"helloworld\"进行多层加密输出。",
-      "source": "auto",
-      "created": "2026-06-26 11:45"
-    },
-    {
-      "id": 8,
-      "content": "用户使用Windows系统路径。",
-      "source": "auto",
-      "created": "2026-06-26 11:45"
-    }
-  ]
+  "id_counter": 0,
+  "facts": []
 }
