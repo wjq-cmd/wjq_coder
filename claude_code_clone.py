@@ -160,7 +160,7 @@ tools = CodeTools(root, memory=memory)
 
 
 # -------------------- Prompt 模板 --------------------
-PROMPT_TPL = """你是私人编码助手，负责分析、修改、调试本地项目。
+PROMPT_TPL = """你是 MyCoder 专属编码助手，负责分析、修改、调试本地项目。
 
 可用工具：
 1. ls|路径 → 列出目录
@@ -481,7 +481,7 @@ if __name__ == "__main__":
             claude_code_agent(user_input, emit=emit_json, confirm_callback=json_confirm)
     else:
         # 普通终端模式
-        print("=== 私人编码助手 ===")
+        print("=== MyCoder ===")
         print(f"已加载 {len(memory.facts)} 条事实记忆")
         print("斜杠指令: /记住 /查看记忆 /删除记忆 /清空记忆")
         print("输入 exit 或 quit 退出\n")

@@ -188,7 +188,7 @@ async function main() {
   // 欢迎横幅
   console.log("");
   console.log(C.brand.bold("  ╔══════════════════════════════╗"));
-  console.log(C.brand.bold("  ║       私 人 编 码 助 手       ║"));
+  console.log(C.brand.bold("  ║           MyCoder              ║"));
   console.log(C.brand.bold("  ╚══════════════════════════════╝"));
   console.log("");
   console.log(C.subtle("  exit / quit 退出  |  输入需求开始对话"));
