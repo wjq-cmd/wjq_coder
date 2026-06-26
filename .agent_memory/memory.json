@@ -1,4 +1,11 @@
 {
-  "id_counter": 2,
-  "facts": []
+  "id_counter": 3,
+  "facts": [
+    {
+      "id": 2,
+      "content": "NONE",
+      "source": "auto",
+      "created": "2026-06-26 11:25"
+    }
+  ]
 }

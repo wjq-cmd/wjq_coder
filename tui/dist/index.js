@@ -262,11 +262,41 @@ async function main() {
                     currentResolve = null;
                 }
                 break;
+            case "confirm_edit":
+                spinnerStop();
+                renderColoredDiff(e.diff);
+                // 等待用户确认，把响应写入 Python stdin
+                process.stdout.write(C.warning("  Allow this edit? [y/n]: "));
+                inputResolve = (answer) => {
+                    const yn = answer.toLowerCase() === "y" || answer === "是" ? "y" : "n";
+                    proc.stdin.write(yn + "\n");
+                    console.log(C.muted(`  → ${yn === "y" ? "已批准" : "已拒绝"}`));
+                };
+                break;
             case "error":
                 spinnerStop();
                 console.log(C.error(`  ✗ ${e.message}`));
                 break;
         }
+    }
+    /** 彩色 diff 渲染：+绿 -红 @@青 */
+    function renderColoredDiff(diff) {
+        console.log("");
+        for (const line of diff.split("\n")) {
+            if (line.startsWith("+") && !line.startsWith("+++")) {
+                console.log(C.success(`  ${line}`));
+            }
+            else if (line.startsWith("-") && !line.startsWith("---")) {
+                console.log(C.error(`  ${line}`));
+            }
+            else if (line.startsWith("@@")) {
+                console.log(chalk.cyan(`  ${line}`));
+            }
+            else {
+                console.log(C.muted(`  ${line}`));
+            }
+        }
+        console.log("");
     }
     // ---- 交互循环（原始 stdin）----
     process.stdin.setEncoding("utf8");

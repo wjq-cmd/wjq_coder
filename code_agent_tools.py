@@ -39,6 +39,21 @@ class CodeTools:
         except Exception as e:
             return f"读取失败: {str(e)}"
 
+    def diff_preview(self, rel_path: str, new_content: str) -> str:
+        """生成文件修改差异预览"""
+        import difflib
+        fp = self.root / rel_path
+        old = fp.read_text(encoding="utf-8") if fp.is_file() else ""
+        old_lines = old.splitlines(keepends=True)
+        new_lines = new_content.splitlines(keepends=True)
+        diff = difflib.unified_diff(
+            old_lines, new_lines,
+            fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}",
+            lineterm=""
+        )
+        result = "\n".join(diff)
+        return result if result else "(新文件，无差异)"
+
     def write_file(self, rel_path: str, content: str) -> str:
         """覆写/新建文件"""
         fp = self.root / rel_path

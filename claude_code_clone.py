@@ -189,8 +189,8 @@ FinalAnswer: 总结做了哪些修改、验证结果、最终结论
 
 
 # -------------------- Agent 主逻辑 --------------------
-def claude_code_agent(user_query: str, max_round=15, emit=None):
-    """emit(event: dict) 可选回调，用于 JSON 模式"""
+def claude_code_agent(user_query: str, max_round=15, emit=None, confirm_callback=None):
+    """confirm_callback(diff_text) -> bool，用于交互式确认文件修改"""
     def _emit(event: dict):
         if emit:
             emit(event)
@@ -326,6 +326,19 @@ def claude_code_agent(user_query: str, max_round=15, emit=None):
 
         if func_name not in TOOL_MAP:
             obs = f"错误：不存在工具 {func_name}"
+        elif func_name == "write" and len(args) >= 2:
+            # 生成 diff 预览 + 交互确认
+            diff_text = tools.diff_preview(args[0], args[1])
+
+            approved = True  # 默认允许（无回调时）
+            if confirm_callback:
+                approved = confirm_callback(diff_text)
+
+            if approved:
+                func = TOOL_MAP[func_name]
+                obs = func(tools, *args)
+            else:
+                obs = f"用户取消了修改: {args[0]}"
         else:
             func = TOOL_MAP[func_name]
             obs = func(tools, *args)
@@ -429,7 +442,14 @@ if __name__ == "__main__":
             def emit_json(event):
                 print(json.dumps(event, ensure_ascii=False), flush=True)
 
-            claude_code_agent(user_input, emit=emit_json)
+            def json_confirm(diff_text: str) -> bool:
+                """JSON 模式：发确认请求，读 stdin 下一行等回复"""
+                print(json.dumps({"type": "confirm_edit", "diff": diff_text},
+                                 ensure_ascii=False), flush=True)
+                reply = sys.stdin.readline()
+                return reply.strip().lower() in ("y", "yes", "是")
+
+            claude_code_agent(user_input, emit=emit_json, confirm_callback=json_confirm)
     else:
         # 普通终端模式
         print("=== 私人编码助手 ===")
@@ -449,4 +469,8 @@ if __name__ == "__main__":
                 print(slash_result)
                 continue
 
-            claude_code_agent(user_input)
+            def terminal_confirm(diff_text: str) -> bool:
+                print(f"\n{diff_text}")
+                return input("\nAllow this edit? [y/n]: ").strip().lower() in ("y", "yes")
+
+            claude_code_agent(user_input, confirm_callback=terminal_confirm)
